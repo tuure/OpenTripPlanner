@@ -17,20 +17,23 @@ package org.opentripplanner.api.ws;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 
 import junit.framework.TestCase;
 
+import org.codehaus.jettison.json.JSONException;
+import org.onebusaway.gtfs.model.AgencyAndId;
 import org.opentripplanner.api.common.ParameterException;
 import org.opentripplanner.api.model.AbsoluteDirection;
 import org.opentripplanner.api.model.Itinerary;
 import org.opentripplanner.api.model.Leg;
 import org.opentripplanner.api.model.RelativeDirection;
 import org.opentripplanner.api.model.WalkStep;
-import org.opentripplanner.api.ws.PlanGenerator;
-import org.opentripplanner.api.ws.Planner;
-import org.opentripplanner.common.model.NamedPlace;
+import org.opentripplanner.api.model.patch.PatchResponse;
+import org.opentripplanner.common.geometry.SphericalDistanceLibrary;
+import org.opentripplanner.common.geometry.GeometryUtils;
 import org.opentripplanner.graph_builder.impl.shapefile.AttributeFeatureConverter;
 import org.opentripplanner.graph_builder.impl.shapefile.CaseBasedTraversalPermissionConverter;
 import org.opentripplanner.graph_builder.impl.shapefile.ShapefileFeatureSourceFactoryImpl;
@@ -38,25 +41,69 @@ import org.opentripplanner.graph_builder.impl.shapefile.ShapefileStreetGraphBuil
 import org.opentripplanner.graph_builder.impl.shapefile.ShapefileStreetSchema;
 import org.opentripplanner.graph_builder.services.shapefile.FeatureSourceFactory;
 import org.opentripplanner.routing.algorithm.GenericAStar;
+import org.opentripplanner.routing.bike_rental.BikeRentalStation;
+import org.opentripplanner.routing.bike_rental.BikeRentalStationService;
 import org.opentripplanner.routing.core.OptimizeType;
+import org.opentripplanner.routing.core.RoutingRequest;
 import org.opentripplanner.routing.core.State;
 import org.opentripplanner.routing.core.TraverseMode;
 import org.opentripplanner.routing.core.TraverseModeSet;
-import org.opentripplanner.routing.core.RoutingRequest;
+import org.opentripplanner.routing.edgetype.PlainStreetEdge;
 import org.opentripplanner.routing.edgetype.StreetTraversalPermission;
 import org.opentripplanner.routing.graph.Graph;
+import org.opentripplanner.routing.graph.Graph.LoadLevel;
 import org.opentripplanner.routing.graph.Vertex;
-import org.opentripplanner.routing.impl.GraphServiceBeanImpl;
 import org.opentripplanner.routing.impl.RetryingPathServiceImpl;
 import org.opentripplanner.routing.impl.StreetVertexIndexServiceImpl;
 import org.opentripplanner.routing.impl.TravelingSalesmanPathService;
+import org.opentripplanner.routing.patch.Patch;
 import org.opentripplanner.routing.services.GraphService;
+import org.opentripplanner.routing.services.PatchService;
 import org.opentripplanner.routing.spt.GraphPath;
+import org.opentripplanner.routing.vertextype.IntersectionVertex;
+import org.opentripplanner.routing.vertextype.StreetVertex;
+
+import com.vividsolutions.jts.geom.LineString;
+
+import static org.mockito.Mockito.*;
+
+class SimpleGraphServiceImpl implements GraphService {
+
+    private HashMap<String, Graph> graphs = new HashMap<String, Graph>();
+
+    @Override
+    public void setLoadLevel(LoadLevel level) {      
+    }
+
+    @Override
+    public void refreshGraphs() {
+    }
+
+    @Override
+    public Graph getGraph() {
+        return graphs.get(null);
+    }
+
+    @Override
+    public Graph getGraph(String routerId) {
+        return graphs.get(routerId);
+    }
+
+    @Override
+    public Collection<String> getGraphIds() {
+        return graphs.keySet();
+    }
+    
+    public void putGraph(String graphId, Graph graph) {
+        graphs.put(graphId, graph);
+    }
+    
+}
 
 /* This is a hack to hold context and graph data between test runs, since loading it is slow. */
 class Context {
     public Graph graph = new Graph();
-    public GraphService graphService = new GraphServiceBeanImpl(graph); 
+    public SimpleGraphServiceImpl graphService = new SimpleGraphServiceImpl();
     public PlanGenerator planGenerator = new PlanGenerator();
     public RetryingPathServiceImpl pathService = new RetryingPathServiceImpl();
     private static Context instance = null;
@@ -67,6 +114,8 @@ class Context {
         return instance;
     }
     public Context() {
+        graphService.putGraph(null, makeSimpleGraph()); //default graph is tiny test graph
+        graphService.putGraph("portland", graph);
         ShapefileStreetGraphBuilderImpl builder = new ShapefileStreetGraphBuilderImpl();
         FeatureSourceFactory factory = new ShapefileFeatureSourceFactoryImpl(new File("src/test/resources/portland/Streets_pdx.shp"));
         builder.setFeatureSourceFactory(factory);
@@ -92,9 +141,51 @@ class Context {
         builder.buildGraph(graph, new HashMap<Class<?>, Object>());
         graph.streetIndex = new StreetVertexIndexServiceImpl(graph);
         
+        initBikeRental();
+
         pathService.sptService = new GenericAStar();
         pathService.graphService = graphService;
         planGenerator.pathService = pathService;
+    }
+
+    private void initBikeRental() {
+        BikeRentalStationService service = new BikeRentalStationService();
+        BikeRentalStation station = new BikeRentalStation();
+        station.x = -122.637634;
+        station.y = 45.513084;
+        station.bikesAvailable = 5;
+        station.spacesAvailable = 4;
+        station.id = "1";
+        station.name = "bike rental station";
+
+        service.addStation(station);
+        graph.putService(BikeRentalStationService.class, service);
+    }
+
+    private Graph makeSimpleGraph() {
+        Graph graph = new Graph();
+        StreetVertex tl = new IntersectionVertex(graph, "tl", -80.01, 40.01, "top and left");
+        StreetVertex tr = new IntersectionVertex(graph, "tr", -80.0, 40.01, "top and right");
+        StreetVertex bl = new IntersectionVertex(graph, "bl", -80.01, 40.0, "bottom and left");
+        StreetVertex br = new IntersectionVertex(graph, "br", -80.0, 40.0, "bottom and right");
+        
+        makeEdges(tl, tr, "top");
+        makeEdges(tl, bl, "left");
+        makeEdges(br, tr, "right");
+        makeEdges(bl, br, "bottom");
+        
+        return graph;
+    }
+
+    private void makeEdges(StreetVertex v1, StreetVertex v2, String name) {
+        LineString geometry = GeometryUtils.makeLineString(v1.getCoordinate().x,
+                v1.getCoordinate().y, v2.getCoordinate().x, v2.getCoordinate().y);
+        double length = SphericalDistanceLibrary.getInstance().distance(v1.getCoordinate(), v2.getCoordinate());
+        new PlainStreetEdge(v1, v2, geometry, name, length, StreetTraversalPermission.ALL, false);
+
+        geometry = GeometryUtils.makeLineString(v2.getCoordinate().x, v2.getCoordinate().y,
+                v1.getCoordinate().x, v1.getCoordinate().y);
+        new PlainStreetEdge(v2, v1, geometry, name, length, StreetTraversalPermission.ALL, true);
     }
 }
 
@@ -103,12 +194,12 @@ public class TestRequest extends TestCase {
 
     public void testRequest() {
         RoutingRequest request = new RoutingRequest();
-        
+
         request.addMode(TraverseMode.CAR);
         assertTrue(request.getModes().getCar());
         request.removeMode(TraverseMode.CAR);
         assertFalse(request.getModes().getCar());
-     
+
         request.setModes(new TraverseModeSet("BICYCLE,WALK"));
         assertFalse(request.getModes().getCar());
         assertTrue(request.getModes().getBicycle());
@@ -116,9 +207,9 @@ public class TestRequest extends TestCase {
     }
 
     public void testPlanner() throws Exception {
-        
-        Planner planner = new TestPlanner("113410", "137427");
-        
+
+        Planner planner = new TestPlanner("portland", "113410", "137427");
+
         Response response = planner.getItineraries();
         Itinerary itinerary = response.getPlan().itinerary.get(0);
         Leg leg = itinerary.legs.get(0);
@@ -137,7 +228,7 @@ public class TestRequest extends TestCase {
     public void testAlerts() throws Exception {
 
 	//SE 47th and Ash, NE 47th and Davis (note that we cross Burnside, this goes from SE to NE)
-	Planner planner = new TestPlanner("114789 back", "114237");
+	Planner planner = new TestPlanner("portland", "114789 back", "114237");
 	Response response = planner.getItineraries();
 
         Itinerary itinerary = response.getPlan().itinerary.get(0);
@@ -158,7 +249,7 @@ public class TestRequest extends TestCase {
 	}
 
     public void testIntermediate() throws Exception {
-        
+
         Graph graph = Context.getInstance().graph;
         Vertex v1 = graph.getVertex("114080 back");//getVertexByCrossStreets("NW 10TH AVE", "W BURNSIDE ST", false);
         Vertex v2 = graph.getVertex("115250");//graph.getOutgoing(getVertexByCrossStreets("SE 82ND AVE", "SE ASH ST", false)).iterator().next().getToVertex();
@@ -169,10 +260,10 @@ public class TestRequest extends TestCase {
         assertNotNull(v2);
         assertNotNull(v3);
         assertNotNull(v4);
-        
-        TestPlanner planner = new TestPlanner(v1.getLabel(), v4.getLabel(), Arrays.asList(v2.getLabel(), v3.getLabel()));
+
+        TestPlanner planner = new TestPlanner("portland", v1.getLabel(), v4.getLabel(), Arrays.asList(v2.getLabel(), v3.getLabel()));
         List<GraphPath> paths = planner.getPaths();
-        
+
         assertTrue(paths.size() > 0);
         GraphPath path = paths.get(0);
         int curVertex = 0;
@@ -183,13 +274,60 @@ public class TestRequest extends TestCase {
         }
         assertEquals(4, curVertex); //found all four, in the correct order (1, 3, 2, 4)
     }
-    
+
+    public void testBikeRental() {
+        BikeRental bikeRental = new BikeRental();
+        bikeRental.setGraphService(Context.getInstance().graphService);
+        //no stations in graph
+        BikeRentalStationList stations = bikeRental.getBikeRentalStations(null,
+                null, null);
+        assertEquals(0, stations.stations.size());
+
+        //no stations in range
+        stations = bikeRental.getBikeRentalStations("55.5,-122.7",
+                "65.6,-122.6", "portland");
+        assertEquals(0, stations.stations.size());
+        //finally, a station
+        stations = bikeRental.getBikeRentalStations("45.5,-122.7",
+                "45.6,-122.6", "portland");
+        assertEquals(1, stations.stations.size());
+    }
+
+    public void testMetadata() throws JSONException {
+        Metadata metadata = new Metadata();
+        metadata.graphService = Context.getInstance().graphService;
+        GraphMetadata data1 = metadata.getMetadata(null);
+        assertTrue("centerLatitude is not 40.005; got " + data1.getCenterLatitude(), 
+                Math.abs(40.005 - data1.getCenterLatitude()) < 0.000001);
+        
+        GraphMetadata data2 = metadata.getMetadata("portland");
+        assertTrue(Math.abs(-122 - data2.getCenterLongitude()) < 1);
+        assertTrue(Math.abs(-122 - data2.getLowerLeftLongitude()) < 2);
+        assertTrue(Math.abs(-122 - data2.getUpperRightLongitude()) < 2);
+
+    }
+
+    /** Smoke test for patcher */
+    public void testPatcher() throws JSONException {
+        Patcher p = new Patcher();
+        PatchService service = mock(PatchService.class);
+        when(service.getStopPatches(any(AgencyAndId.class))).thenReturn(new ArrayList<Patch>());
+        when(service.getRoutePatches(any(AgencyAndId.class))).thenReturn(new ArrayList<Patch>());
+
+        p.setPatchService(service);
+        PatchResponse stopPatches = p.getStopPatches("TriMet", "5678");
+        assertNull(stopPatches.patches);
+        PatchResponse routePatches = p.getRoutePatches("TriMet", "100");
+        assertNull(routePatches.patches);
+        
+    }
+
     /**
      * Subclass of Planner for testing. Constructor sets fields that would usually be set by 
      * Jersey from HTTP Query string.
      */
     private static class TestPlanner extends Planner {
-        public TestPlanner(String v1, String v2) {
+        public TestPlanner(String routerId, String v1, String v2) {
             super();
             this.fromPlace = Arrays.asList(v1);
             this.toPlace = Arrays.asList(v2);
@@ -202,12 +340,12 @@ public class TestRequest extends TestCase {
             this.numItineraries = Arrays.asList(1);
             this.transferPenalty = Arrays.asList(0);
             this.maxTransfers = Arrays.asList(2);
-            
+            this.routerId = Arrays.asList(routerId);
             this.planGenerator = Context.getInstance().planGenerator;
         }
 
-        public TestPlanner(String v1, String v2, List<String> intermediates) {
-            this(v1, v2);
+        public TestPlanner(String routerId, String v1, String v2, List<String> intermediates) {
+            this(routerId, v1, v2);
             this.intermediatePlaces = intermediates;
             TravelingSalesmanPathService tsp = new TravelingSalesmanPathService();
             tsp.setChainedPathService(Context.getInstance().pathService);
@@ -227,5 +365,5 @@ public class TestRequest extends TestCase {
         }
         
     }
-    
+
 }
