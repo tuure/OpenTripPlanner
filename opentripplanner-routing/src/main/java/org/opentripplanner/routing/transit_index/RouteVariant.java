@@ -31,6 +31,7 @@ import org.opentripplanner.gtfs.GtfsLibrary;
 import org.opentripplanner.routing.graph.Edge;
 import org.opentripplanner.routing.core.TraverseMode;
 import org.opentripplanner.routing.patch.AgencyAndIdAdapter;
+import org.opentripplanner.routing.patch.LineStringAdapter;
 import org.opentripplanner.routing.patch.StopAdapter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -211,6 +212,7 @@ public class RouteVariant implements Serializable {
         return direction;
     }
 
+    @XmlJavaTypeAdapter(LineStringAdapter.class)
     public LineString getGeometry() {
         if (geometry == null) {
             List<Coordinate> coords = new ArrayList<Coordinate>();
