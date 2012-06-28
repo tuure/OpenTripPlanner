@@ -489,12 +489,10 @@ public class RoutingRequest implements Cloneable, Serializable {
 
     public void setDateTime(Date dateTime) {
         this.dateTime = dateTime.getTime() / 1000;
-        LOG.debug("JVM default timezone is {}", TimeZone.getDefault());
-        LOG.debug("Request datetime parsed as {}", dateTime);
     }
 
-    public void setDateTime(String date, String time) {
-        Date dateObject = DateUtils.toDate(date, time);
+    public void setDateTime(String date, String time, TimeZone tz) {
+        Date dateObject = DateUtils.toDate(date, time, tz);
         setDateTime(dateObject);
     }
 
